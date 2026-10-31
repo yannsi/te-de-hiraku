@@ -113,10 +113,50 @@ for (const [key, s] of Object.entries(SITES)) {
 let recognizer = null, stream = null, running = false, lastVideoTime = -1;
 let current = null, since = 0, lastSeen = 0, firing = false;
 
+// ===== 読み込み（ページを開いた時点で始める） =====
+let loadState = "読み込み中…";
+let waitingForModel = false;
+
+function showLoad(text) {
+  loadState = text;
+  if (waitingForModel || !overlay.hidden) msg.textContent = text;
+}
+
+// モデルを進み具合つきで取得する
+async function fetchWithProgress(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error("モデルを取得できません（" + res.status + "）");
+  const total = Number(res.headers.get("content-length")) || 0;
+  if (!res.body || !total) return new Uint8Array(await res.arrayBuffer());
+  const reader = res.body.getReader();
+  const buf = new Uint8Array(total);
+  let got = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (got + value.length > buf.length) { // 念のため
+      const bigger = new Uint8Array(got + value.length);
+      bigger.set(buf.subarray(0, got));
+      bigger.set(value, got);
+      got += value.length;
+      return bigger;
+    }
+    buf.set(value, got);
+    got += value.length;
+    showLoad(`読み込み中… ${Math.floor((got / total) * 100)}%`);
+  }
+  return buf.subarray(0, got);
+}
+
 async function loadModel() {
-  const fileset = await FilesetResolver.forVisionTasks(WASM);
+  showLoad("読み込み中…");
+  const [fileset, model] = await Promise.all([
+    FilesetResolver.forVisionTasks(WASM),
+    fetchWithProgress(MODEL),
+  ]);
+  showLoad("仕上げ中…");
   const opts = (delegate) => ({
-    baseOptions: { modelAssetPath: MODEL, delegate },
+    baseOptions: { modelAssetBuffer: model, delegate },
     runningMode: "VIDEO",
     numHands: 1,
   });
@@ -125,25 +165,38 @@ async function loadModel() {
   } catch {
     recognizer = await GestureRecognizer.createFromOptions(fileset, opts("CPU"));
   }
+  showLoad("準備できました");
 }
+
+let modelPromise = loadModel().catch((e) => { modelPromise = null; throw e; });
+modelPromise.catch(() => showLoad("読み込みに失敗しました。もう一度押してください"));
 
 startBtn.addEventListener("click", async () => {
   startBtn.disabled = true;
-  msg.textContent = "準備中…（初回は少し時間がかかります）";
   try {
-    if (!recognizer) await loadModel();
-    stream = await navigator.mediaDevices.getUserMedia({
+    // カメラの起動と読み込みを同時に進める
+    const cam = navigator.mediaDevices.getUserMedia({
       video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } },
       audio: false,
     });
+    if (!recognizer) {
+      if (!modelPromise) modelPromise = loadModel();
+      waitingForModel = true;
+      msg.textContent = loadState;
+    }
+    stream = await cam;
     video.srcObject = stream;
     await video.play();
+    if (!recognizer) await modelPromise;
+    waitingForModel = false;
     overlay.hidden = true;
     current = null; firing = false; lastVideoTime = -1;
     running = true;
     requestAnimationFrame(loop);
   } catch (e) {
-    msg.textContent = "カメラを使えませんでした：" + (e && e.message ? e.message : e);
+    waitingForModel = false;
+    if (!recognizer) modelPromise = null;
+    msg.textContent = "うまく始められませんでした：" + (e && e.message ? e.message : e);
     startBtn.disabled = false;
   }
 });
